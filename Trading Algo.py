@@ -4,31 +4,14 @@ from scipy import stats
 # endregion
 
 #next steps: 
-# if transaction cost = loss => close?
-# if volatility go up, then long iron butterfly
-# if volatitlity go down, then short
-
-
-
 #trade only options with large implied volatility
 #optimize butterfly wing spread 
 #find good exit time
 
-
-#sync up implied volatility and historical volatility
-#do research into historical diff between implied and realized vol: build different thresholds for different market conditions
-#look at event buffers
-
-# look at transaction costs - reduce frequency of rebalancing
-
-
-
-
-
 class ODTE_Options_Research(QCAlgorithm):
 
     def initialize(self):
-        self.set_start_date(2023, 10, 1)
+        self.set_start_date(2023, 8, 1)
         self.set_cash(100000)
         #The following algorithm selects 0DTE Option contracts for the SPY that fall within X strikes of the underlying price.
         option = self.add_option('SPY', Resolution.HOUR)
@@ -54,7 +37,7 @@ class ODTE_Options_Research(QCAlgorithm):
 
     
     def calculate_historical_volatility(self):
-        history = self.history(self.spy, self.lookback_period, Resolution.HOUR)
+        history = self.history(self.spy, self.lookback_period, Resolution.DAILY)
         if len(history) < self.lookback_period:
             return None
         daily_returns = history['close'].pct_change().dropna()
