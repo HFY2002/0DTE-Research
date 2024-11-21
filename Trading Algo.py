@@ -47,6 +47,20 @@ class ODTE_Options_Research(QCAlgorithm):
 
         # Add SPY equity data
         self.spy = self.add_equity("SPY", Resolution.HOUR).Symbol
+        
+        # Parameters
+        self.confidence = 0.95
+        self.kelly_norm_factor = 1/10
+        self.stop_loss_ratio = 1/10
+        self.param_dict = {
+            10: (2.724, 0.0394, 0.5486),
+            11: (2.6739, 0.0345, 0.4739),
+            12: (2.4785, 0.0339, 0.4057),
+            13: (2.2987, 0.0246, 0.3525),
+            14: (2.1135, 0.0197, 0.2938),
+            15: (2.0658, 0.0120, 0.2170),
+        }
+        self.payoff = None
 
     def _filter(self, universe):
         """
@@ -80,19 +94,11 @@ class ODTE_Options_Research(QCAlgorithm):
         hv = np.std(returns) * (252 ** 0.5)  # Annualized volatility
         return hv
 
-    def set_wing_spread(self, time, confidence=95):
+    def set_wing_spread(self, time, confidence = 100*self.confidence):
         """
         Determines the wing spread based on predefined parameters for different times.
         """
-        param_dict = {
-            10: (2.724, 0.0394, 0.5486),
-            11: (2.6739, 0.0345, 0.4739),
-            12: (2.4785, 0.0339, 0.4057),
-            13: (2.2987, 0.0246, 0.3525),
-            14: (2.1135, 0.0197, 0.2938),
-            15: (2.0658, 0.0120, 0.2170),
-        }
-        degrees_of_freedom, mean, scale = param_dict[time]
+        degrees_of_freedom, mean, scale = self.param_dict[time]
         return self.t_distribution_spread(degrees_of_freedom, mean, scale, confidence)
 
     def select_wing_spreads(self, chain, atm_strike, wing_spread_pct, epsilon=0.5):
@@ -190,7 +196,13 @@ class ODTE_Options_Research(QCAlgorithm):
 
         return max_profit, max_loss, payoff
 
+    def create_t_distribution(self, degrees_of_freedom, mean, scale, atm):
+        new_degrees_of_freedom, new_mean, new_scale = 0,0,0
+        return new_degrees_of_freedom, new_mean, new_scale
 
+    def calculate_EV(self, new_degrees_of_freedom, new_mean, new_scale, payoff):
+        EV = 0
+        return EV
 
     def on_data(self, slice: Slice) -> None:
         spy_data = slice.Bars.get(self.spy)
@@ -207,11 +219,21 @@ class ODTE_Options_Research(QCAlgorithm):
         else:
             return
 
-        if self.is_warming_up:
+        if self.is_warming_up or self.Time.hour == 16:
             #self.Debug(f"Warmup progress: {len(self.running_window)/self.window_len:.2%}")
             return
 
-        if self.portfolio.invested or self.Time.hour == 16:
+        if self.portfolio.invested:
+            #check for stop-loss or if need to liquidate
+            payoff = self.payoff
+            atm_strike = atm_strike = sorted(chain, key=lambda x: abs(x.strike - chain.underlying.price))[0].strike
+            degrees_of_freedom, mean, scale = self.param_dict[self.Time.hour]
+            p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
+            curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, payoff)
+            if curr_EV < 30:
+                self.debug(f"total portfolio cash before liquidating before end of day {self.Portfolio.Cash}")
+                self.liquidate()
+                self.debug(f"total portfolio cash after liquidating before end of day {self.Portfolio.Cash}")
             return
 
         iv_hv_ratio = avg_iv / historical_volatility
@@ -238,17 +260,37 @@ class ODTE_Options_Research(QCAlgorithm):
             f"Using wing spread within epsilon: ATM Strike: {atm_strike}, OTM Put: {closest_otm_put_strike}, OTM Call: {closest_otm_call_strike}, IV/HV Ratio: {iv_hv_ratio:.2f}"
         )    # Add all option legs to the securities dictionary
         net_premium_received, max_loss, payoff = self.compute_iron_butterfly_metrics(iron_butterfly, chain)
+        self.payoff = payoff
         # Calculate payoff for a specific underlying price at expiration
         self.Debug(f"net_premium {net_premium_received}, max_loss {max_loss}")
-        self.Debug(f"Payoff at atm = {payoff(atm_strike)}: Payoff at otm_put = {payoff(closest_otm_put_strike-100)}: Payoff at otm_call = {payoff(closest_otm_call_strike+100)}")
+        self.Debug(f"Payoff at atm = {self.payoff(atm_strike)}: Payoff at otm_put = {self.payoff(closest_otm_put_strike)}: Payoff at otm_call = {self.payoff(closest_otm_call_strike)}")
+
+        p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
+        curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, payoff)
+        if curr_EV < 0:
+            self.Debug(f"EV is negative at {self.Time}, no trade placed")
+            return
+        #calculate percentage of capital to allocate and corresponding no# of shares
+        #approximating payoff curve as a step function
+        loss = max_loss#*self.stop_loss_ratio #remember: we can change loss = max_loss when doing risk control. loss refers to per-trade loss
+        win = (curr_EV - loss*(1-self.confidence))/self.confidence
+        #Calculate Kelly Criterion Percent
+        capital_risked_pct = (self.confidence*loss - (1-self.confidence)*win)/(win*loss)
+        #regularize and cap at 15% for risk management, and prevent % from being zero
+        capital_risked_pct = max(0, min(capital_risked_pct * self.kelly_norm_factor, 0.15))
+        self.Debug(f"capital_risked_pct is {capital_risked_pct}")
+        no_trades = int((capital_risked_pct*self.Portfolio.TotalPortfolioValue)/loss)
 
 
-
-        self.Buy(iron_butterfly, 2)
+        self.debug(f"total portfolio cash before buying {self.Portfolio.Cash}")
+        self.Buy(iron_butterfly, no_trades)
+        elf.debug(f"total portfolio cash after buying {self.Portfolio.cash}, num trades placed {no_trades}, premium {net_premium_received}")
 
 
 
 
     def on_end_of_day(self, symbol: Symbol) -> None:
         self.Debug(f"End of day for {Symbol} on {self.Time}")
+        self.debug(f"total portfolio cash before liquidating at end of day {self.Portfolio.Cash}")
         self.liquidate()
+        self.debug(f"total portfolio cash after liquidating at end of day {self.Portfolio.Cash}")
