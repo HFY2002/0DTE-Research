@@ -1,9 +1,3 @@
-# region imports
-from AlgorithmImports import *
-from scipy import stats
-from collections import deque
-import numpy as np
-
 #next steps: 
 # if transaction cost = loss => close?
 # if volatility go up, then long iron butterfly
@@ -22,34 +16,41 @@ import numpy as np
             # a) need way to calculate expected win rate
             # b) need way to calculate expected profit and loss
 
- 
+
+
+from AlgorithmImports import *
+from scipy import stats
+from collections import deque
+import numpy as np
+from scipy.stats import t
+
 class ODTE_Options_Research(QCAlgorithm):
 
-    def initialize(self):
-        self.set_start_date(2024, 6, 1)
-        self.set_cash(1000000)
+    def Initialize(self):
+        self.SetStartDate(2024, 6, 1)
+        self.SetCash(1000000)
 
         # Add SPY option data with hourly resolution
-        option = self.add_option('SPY', Resolution.HOUR)
+        option = self.AddOption('SPY', Resolution.Hour)
         self._symbol = option.Symbol
-        option.set_filter(self._filter)
+        option.SetFilter(self._filter)
 
         # Running window for price data
-        self.lookback_period = 5  # Lookback period for historical volatility
+        self.lookback_period = 30  # Lookback period for historical volatility
         self.price_window = deque(maxlen=self.lookback_period)
 
         # Running window for IV/HV ratios
-        self.window_len = 10
+        self.window_len = 300
         self.running_window = deque(maxlen=self.window_len)
 
         # Warm-up period for sufficient data collection
-        self.SetWarmUp(self.window_len, Resolution.HOUR)
+        self.SetWarmUp(self.window_len, Resolution.Hour)
 
         # Add SPY equity data
-        self.spy = self.add_equity("SPY", Resolution.HOUR).Symbol
+        self.spy = self.AddEquity("SPY", Resolution.Hour).Symbol
         
         # Parameters
-        self.confidence = 0.95
+        self.confidence = 0.97
         self.kelly_norm_factor = 1/10
         self.stop_loss_ratio = 1/10
         self.param_dict = {
@@ -60,13 +61,14 @@ class ODTE_Options_Research(QCAlgorithm):
             14: (2.1135, 0.0197, 0.2938),
             15: (2.0658, 0.0120, 0.2170),
         }
-        self.payoff = None
+
+        self.positions = []
 
     def _filter(self, universe):
         """
         Filters option contracts to include only weekly expirations with 0 days to expiry.
         """
-        return universe.include_weeklys().expiration(0, 0)
+        return universe.IncludeWeeklys().Expiration(0, 0)
 
     def t_distribution_spread(self, degrees_of_freedom, mean, scale, percent):
         """
@@ -99,20 +101,20 @@ class ODTE_Options_Research(QCAlgorithm):
         Determines the wing spread based on predefined parameters for different times.
         """
         degrees_of_freedom, mean, scale = self.param_dict[time]
-        return self.t_distribution_spread(degrees_of_freedom, mean, scale, 100*self.confidence)
+        return self.t_distribution_spread(degrees_of_freedom, mean, scale, 100 * self.confidence)
 
     def select_wing_spreads(self, chain, atm_strike, wing_spread_pct, epsilon=0.5):
         """
         Selects symmetric strike prices for an iron butterfly strategy.
         """
-        calls = [i for i in chain if i.right == OptionRight.CALL]
-        puts = [i for i in chain if i.right == OptionRight.PUT]
+        calls = [i for i in chain if i.Right == OptionRight.Call]
+        puts = [i for i in chain if i.Right == OptionRight.Put]
         if not calls or not puts:
             self.Debug("No calls or puts found.")
             return None, None
 
-        available_put_strikes = [x.strike for x in puts]
-        available_call_strikes = [x.strike for x in calls]
+        available_put_strikes = [x.Strike for x in puts]
+        available_call_strikes = [x.Strike for x in calls]
 
         wing_spread = wing_spread_pct * atm_strike
         valid_put_strikes = [
@@ -136,9 +138,43 @@ class ODTE_Options_Research(QCAlgorithm):
         )
         return closest_symmetric_pair
 
-    def compute_iron_butterfly_metrics(self, iron_butterfly, chain):
+    class Position:
+        def __init__(self, iron_butterfly, chain, net_premium_received, max_loss, m, fee,
+                     C_0_ATM, P_0_ATM, C_0_OTM, P_0_OTM, K_C_ATM, K_P_ATM, K_C_OTM, K_P_OTM,
+                     atm_strike, entry_time):
+            self.iron_butterfly = iron_butterfly
+            self.chain = chain
+            self.net_premium_received = net_premium_received
+            self.max_loss = max_loss
+            self.m = m
+            self.fee = fee
+            self.C_0_ATM = C_0_ATM
+            self.P_0_ATM = P_0_ATM
+            self.C_0_OTM = C_0_OTM
+            self.P_0_OTM = P_0_OTM
+            self.K_C_ATM = K_C_ATM
+            self.K_P_ATM = K_P_ATM
+            self.K_C_OTM = K_C_OTM
+            self.K_P_OTM = K_P_OTM
+            self.atm_strike = atm_strike
+            self.entry_time = entry_time
+            self.is_active = True
+
+        def payoff(self, S_T):
+            # Option values at expiration
+            C_T_OTM = np.maximum(S_T - self.K_C_OTM, 0)
+            C_T_ATM = np.maximum(S_T - self.K_C_ATM, 0)
+            P_T_OTM = np.maximum(self.K_P_OTM - S_T, 0)
+            P_T_ATM = np.maximum(self.K_P_ATM - S_T, 0)
+
+            # Payoff calculation
+            P_T = ((C_T_OTM + P_T_OTM - C_T_ATM - P_T_ATM -
+                    (self.C_0_OTM + self.P_0_OTM - self.C_0_ATM - self.P_0_ATM)) * self.m) - self.fee
+            return P_T
+
+    def compute_iron_butterfly_metrics(self, iron_butterfly, chain, atm_strike):
         m = 100  # Contract multiplier for options
-        fee = 0.6  # Set fees according to your brokerage model
+        fee = 0.4  # Set fees according to your brokerage model
         # Initialize variables to store option premiums and strikes
         C_0_ATM = P_0_ATM = C_0_OTM = P_0_OTM = None
         K_C_ATM = K_P_ATM = K_C_OTM = K_P_OTM = None
@@ -173,41 +209,39 @@ class ODTE_Options_Research(QCAlgorithm):
         # Check if all necessary premiums and strikes are collected
         if None in [C_0_ATM, P_0_ATM, C_0_OTM, P_0_OTM, K_C_ATM, K_P_ATM, K_C_OTM, K_P_OTM]:
             self.Debug("Incomplete data to compute metrics.")
-            return None, None, None
+            return None
         # Net premium received per contract (without multiplier)
         net_premium_received_per_contract = (C_0_ATM + P_0_ATM) - (C_0_OTM + P_0_OTM)
         net_premium_received = net_premium_received_per_contract * m
         max_profit = net_premium_received - fee
         # Wing width (difference between strikes)
-        wing_width = K_C_OTM - K_C_ATM  # Should be equal to K_P_ATM - K_P_OTM
+        wing_width = K_C_OTM - K_C_ATM
         # Maximum loss
         max_loss = ((wing_width - net_premium_received_per_contract) * m) - fee
-        # Define the payoff function
-        def payoff(S_T):
-            # Option values at expiration
-            C_T_OTM = max(S_T - K_C_OTM, 0)
-            C_T_ATM = max(S_T - K_C_ATM, 0)
-            P_T_OTM = max(K_P_OTM - S_T, 0)
-            P_T_ATM = max(K_P_ATM - S_T, 0)
-
-            # Payoff calculation per the provided formula
-            P_T = ((C_T_OTM + P_T_OTM - C_T_ATM - P_T_ATM - (C_0_OTM + P_0_OTM - C_0_ATM - P_0_ATM)) * m) - fee
-            return P_T
-
-        return max_profit, max_loss, payoff
+        # Create Position object
+        position = self.Position(
+            iron_butterfly=iron_butterfly,
+            chain=chain,
+            net_premium_received=net_premium_received,
+            max_loss=max_loss,
+            m=m,
+            fee=fee,
+            C_0_ATM=C_0_ATM,
+            P_0_ATM=P_0_ATM,
+            C_0_OTM=C_0_OTM,
+            P_0_OTM=P_0_OTM,
+            K_C_ATM=K_C_ATM,
+            K_P_ATM=K_P_ATM,
+            K_C_OTM=K_C_OTM,
+            K_P_OTM=K_P_OTM,
+            atm_strike=atm_strike,
+            entry_time=self.Time
+        )
+        return position
 
     def create_t_distribution(self, degrees_of_freedom, mean, scale, atm):
         """
         Constructs the t-distribution for the final asset price given the % change distribution.
-
-        Args:
-            degrees_of_freedom (int): Degrees of freedom for the t-distribution of % change.
-            mean (float): Mean of the t-distribution for % change.
-            scale (float): Scale (standard deviation) of the t-distribution for % change.
-            atm (float): Current at-the-money price of the asset.
-
-        Returns:
-            tuple: New degrees_of_freedom, mean, and scale for the final price distribution.
         """
         new_degrees_of_freedom = degrees_of_freedom  # Degrees of freedom remain the same
         new_mean = atm * (1 + mean)  # Adjust mean for final price
@@ -218,56 +252,47 @@ class ODTE_Options_Research(QCAlgorithm):
     def calculate_EV(self, new_degrees_of_freedom, new_mean, new_scale, payoff):
         """
         Calculates the expected value of the payoff function under the given distribution.
-
-        Args:
-            new_degrees_of_freedom (int): Degrees of freedom for the final price distribution.
-            new_mean (float): Mean of the final price distribution.
-            new_scale (float): Scale of the final price distribution.
-            payoff (function): Payoff function.
-
-        Returns:
-            float: Expected value of the payoff.
         """
         # Define the Student's t-distribution for the final price
         distribution = t(df=new_degrees_of_freedom, loc=new_mean, scale=new_scale)
         
         # Approximate expected value using numerical integration
-        x = np.linspace(distribution.ppf(0.001), distribution.ppf(0.999), 1000)
+        x = np.linspace(distribution.ppf(0.001), distribution.ppf(0.999), 10000)
         pdf = distribution.pdf(x)
         EV = np.sum(payoff(x) * pdf * (x[1] - x[0]))
 
         return EV
 
-    def on_data(self, slice: Slice) -> None:
+    def OnData(self, slice: Slice) -> None:
         spy_data = slice.Bars.get(self.spy)
         if spy_data:
             self.update_price_window(spy_data.Close)
 
         historical_volatility = self.calculate_historical_volatility()
-        chain = slice.option_chains.get(self._symbol, None)
+        chain = slice.OptionChains.get(self._symbol, None)
         if chain:
-            avg_iv = sum(x.implied_volatility for x in chain) / len([i for i in chain])
+            avg_iv = sum(x.ImpliedVolatility for x in chain) / len([i for i in chain])
             if historical_volatility and historical_volatility > 0:
                 iv_hv_ratio = avg_iv / historical_volatility
                 self.running_window.append(iv_hv_ratio)
         else:
             return
 
-        if self.is_warming_up or self.Time.hour == 16:
-            #self.Debug(f"Warmup progress: {len(self.running_window)/self.window_len:.2%}")
+        if self.IsWarmingUp or self.Time.hour == 16:
             return
 
-        if self.portfolio.invested:
-            #check for stop-loss or if need to liquidate
-            payoff = self.payoff
-            atm_strike = atm_strike = sorted(chain, key=lambda x: abs(x.strike - chain.underlying.price))[0].strike
-            degrees_of_freedom, mean, scale = self.param_dict[self.Time.hour]
-            p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
-            curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, payoff)
-            if curr_EV < 30:
-                self.debug(f"total portfolio cash before liquidating before end of day {self.Portfolio.Cash}")
-                self.liquidate()
-                self.debug(f"total portfolio cash after liquidating before end of day {self.Portfolio.Cash}")
+        if self.Portfolio.Invested:
+            for position in self.positions:
+                if position.is_active:
+                    degrees_of_freedom, mean, scale = self.param_dict.get(self.Time.hour, (2.0658, 0.0120, 0.2170))
+                    p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, position.atm_strike)
+                    curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, position.payoff)
+                    if curr_EV < 30:
+                        self.Debug(f"Closing position entered at {position.entry_time}")
+                        self.Debug(f"Total portfolio cash before liquidating: {self.Portfolio.Cash}")
+                        self.Liquidate(position.iron_butterfly)
+                        self.Debug(f"Total portfolio cash after liquidating: {self.Portfolio.Cash}")
+                        position.is_active = False
             return
 
         iv_hv_ratio = avg_iv / historical_volatility
@@ -277,54 +302,54 @@ class ODTE_Options_Research(QCAlgorithm):
             self.Debug(f"Skipping trade: IV/HV ratio ({iv_hv_ratio:.2f}) below {iv_hv_lower_bound}th percentile ({percentile:.2f})")
             return
 
-        expiry = max([x.expiry for x in chain])
-        atm_strike = sorted(chain, key=lambda x: abs(x.strike - chain.underlying.price))[0].strike
-        wing_spread_pct = self.set_wing_spread(self.Time.hour)/100
+        expiry = max([x.Expiry for x in chain])
+        atm_strike = sorted(chain, key=lambda x: abs(x.Strike - chain.Underlying.Price))[0].Strike
+        wing_spread_pct = self.set_wing_spread(self.Time.hour) / 100
         closest_otm_put_strike, closest_otm_call_strike = self.select_wing_spreads(chain, atm_strike, wing_spread_pct)
 
         if closest_otm_put_strike is None or closest_otm_call_strike is None:
             return
         
-        
-        iron_butterfly = OptionStrategies.iron_butterfly(
+        iron_butterfly = OptionStrategies.IronButterfly(
             self._symbol, closest_otm_put_strike, atm_strike, closest_otm_call_strike, expiry
         )
         self.Debug(
             f"Placing Iron Butterfly trade at {self.Time.date()}.\n"
             f"Using wing spread within epsilon: ATM Strike: {atm_strike}, OTM Put: {closest_otm_put_strike}, OTM Call: {closest_otm_call_strike}, IV/HV Ratio: {iv_hv_ratio:.2f}"
-        )    # Add all option legs to the securities dictionary
-        net_premium_received, max_loss, payoff = self.compute_iron_butterfly_metrics(iron_butterfly, chain)
-        self.payoff = payoff
-        # Calculate payoff for a specific underlying price at expiration
-        self.Debug(f"net_premium {net_premium_received}, max_loss {max_loss}")
-        self.Debug(f"Payoff at atm = {self.payoff(atm_strike)}: Payoff at otm_put = {self.payoff(closest_otm_put_strike)}: Payoff at otm_call = {self.payoff(closest_otm_call_strike)}")
+        )
 
-        p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
-        curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, payoff)
-        if curr_EV < 0:
-            self.Debug(f"EV is negative at {self.Time}, no trade placed")
+        position = self.compute_iron_butterfly_metrics(iron_butterfly, chain, atm_strike)
+        if position is None:
             return
-        #calculate percentage of capital to allocate and corresponding no# of shares
-        #approximating payoff curve as a step function
-        loss = max_loss#*self.stop_loss_ratio #remember: we can change loss = max_loss when doing risk control. loss refers to per-trade loss
-        win = (curr_EV - loss*(1-self.confidence))/self.confidence
-        #Calculate Kelly Criterion Percent
-        capital_risked_pct = (self.confidence*loss - (1-self.confidence)*win)/(win*loss)
-        #regularize and cap at 15% for risk management, and prevent % from being zero
+
+        degrees_of_freedom, mean, scale = self.param_dict[self.Time.hour]
+        p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, position.atm_strike)
+        curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, position.payoff)
+        if curr_EV < 0:
+            self.Debug(f"EV is negative at {self.Time} with value of {curr_EV}, no trade placed")
+            return
+        self.debug(f"currEV is {curr_EV}, we are going to buy now")
+        loss = position.max_loss
+        win = (curr_EV - loss * (1 - self.confidence)) / self.confidence
+        # Calculate Kelly Criterion Percent
+        capital_risked_pct = (self.confidence * loss - (1 - self.confidence) * win) / (win * loss)
+        # Regularize and cap at 15% for risk management, and prevent % from being zero
         capital_risked_pct = max(0, min(capital_risked_pct * self.kelly_norm_factor, 0.15))
-        self.Debug(f"capital_risked_pct is {capital_risked_pct}")
-        no_trades = int((capital_risked_pct*self.Portfolio.TotalPortfolioValue)/loss)
+        self.Debug(f"Capital risked percentage is {capital_risked_pct}")
+        no_trades = int((capital_risked_pct * self.Portfolio.TotalPortfolioValue) / loss)
 
+        self.Debug(f"Total portfolio cash before buying: {self.Portfolio.Cash}")
+        self.Buy(position.iron_butterfly, no_trades)
+        self.Debug(f"Total portfolio cash after buying: {self.Portfolio.Cash}, number of trades placed: {no_trades}, premium: {position.net_premium_received}")
 
-        self.debug(f"total portfolio cash before buying {self.Portfolio.Cash}")
-        self.Buy(iron_butterfly, no_trades)
-        elf.debug(f"total portfolio cash after buying {self.Portfolio.cash}, num trades placed {no_trades}, premium {net_premium_received}")
+        self.positions.append(position)
 
-
-
-
-    def on_end_of_day(self, symbol: Symbol) -> None:
-        self.Debug(f"End of day for {Symbol} on {self.Time}")
-        self.debug(f"total portfolio cash before liquidating at end of day {self.Portfolio.Cash}")
+    def OnEndOfDay(self, symbol: Symbol) -> None:
+        # self.Debug(f"End of day for {symbol} on {self.Time}")
+        # self.Debug(f"Total portfolio cash before liquidating at end of day: {self.Portfolio.Cash}")
+        # for position in self.positions:
+        #     if position.is_active:
+        #         self.Liquidate(position.iron_butterfly)
+        #         position.is_active = False
+        # self.Debug(f"Total portfolio cash after liquidating at end of day: {self.Portfolio.Cash}")
         self.liquidate()
-        self.debug(f"total portfolio cash after liquidating at end of day {self.Portfolio.Cash}")
