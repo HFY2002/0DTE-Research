@@ -94,12 +94,12 @@ class ODTE_Options_Research(QCAlgorithm):
         hv = np.std(returns) * (252 ** 0.5)  # Annualized volatility
         return hv
 
-    def set_wing_spread(self, time, confidence = 100*self.confidence):
+    def set_wing_spread(self, time):
         """
         Determines the wing spread based on predefined parameters for different times.
         """
         degrees_of_freedom, mean, scale = self.param_dict[time]
-        return self.t_distribution_spread(degrees_of_freedom, mean, scale, confidence)
+        return self.t_distribution_spread(degrees_of_freedom, mean, scale, 100*self.confidence)
 
     def select_wing_spreads(self, chain, atm_strike, wing_spread_pct, epsilon=0.5):
         """
@@ -197,11 +197,45 @@ class ODTE_Options_Research(QCAlgorithm):
         return max_profit, max_loss, payoff
 
     def create_t_distribution(self, degrees_of_freedom, mean, scale, atm):
-        new_degrees_of_freedom, new_mean, new_scale = 0,0,0
+        """
+        Constructs the t-distribution for the final asset price given the % change distribution.
+
+        Args:
+            degrees_of_freedom (int): Degrees of freedom for the t-distribution of % change.
+            mean (float): Mean of the t-distribution for % change.
+            scale (float): Scale (standard deviation) of the t-distribution for % change.
+            atm (float): Current at-the-money price of the asset.
+
+        Returns:
+            tuple: New degrees_of_freedom, mean, and scale for the final price distribution.
+        """
+        new_degrees_of_freedom = degrees_of_freedom  # Degrees of freedom remain the same
+        new_mean = atm * (1 + mean)  # Adjust mean for final price
+        new_scale = atm * scale  # Adjust scale for final price
+
         return new_degrees_of_freedom, new_mean, new_scale
 
     def calculate_EV(self, new_degrees_of_freedom, new_mean, new_scale, payoff):
-        EV = 0
+        """
+        Calculates the expected value of the payoff function under the given distribution.
+
+        Args:
+            new_degrees_of_freedom (int): Degrees of freedom for the final price distribution.
+            new_mean (float): Mean of the final price distribution.
+            new_scale (float): Scale of the final price distribution.
+            payoff (function): Payoff function.
+
+        Returns:
+            float: Expected value of the payoff.
+        """
+        # Define the Student's t-distribution for the final price
+        distribution = t(df=new_degrees_of_freedom, loc=new_mean, scale=new_scale)
+        
+        # Approximate expected value using numerical integration
+        x = np.linspace(distribution.ppf(0.001), distribution.ppf(0.999), 1000)
+        pdf = distribution.pdf(x)
+        EV = np.sum(payoff(x) * pdf * (x[1] - x[0]))
+
         return EV
 
     def on_data(self, slice: Slice) -> None:
