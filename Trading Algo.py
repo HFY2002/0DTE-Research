@@ -7,14 +7,11 @@
 #do research into historical diff between implied and realized vol: build different thresholds for different market conditions
 #look at event buffers
 
-# look at transaction costs - reduce frequency of rebalancing
-
     #WORK TO BE DONE
-    #1) find way to make bets % of portfolio
     #   a) search documentaion
-    #   b) need function to determine percentage of capital to bet:
-            # a) need way to calculate expected win rate
-            # b) need way to calculate expected profit and loss
+
+    #FIND WAY TO CALCULATE LIQUIDSTED PFORIT
+    #and handle margin calls
 
 from AlgorithmImports import *
 from scipy import stats
@@ -295,6 +292,7 @@ class ODTE_Options_Research(QCAlgorithm):
         historical_volatility = self.calculate_historical_volatility()
         chain = slice.OptionChains.get(self._symbol, None)
         if chain:
+            atm_strike = sorted(chain, key=lambda x: abs(x.Strike - chain.Underlying.Price))[0].Strike
             avg_iv = sum(x.ImpliedVolatility for x in chain) / len([i for i in chain])
             if historical_volatility and historical_volatility > 0:
                 iv_hv_ratio = avg_iv / historical_volatility
@@ -318,8 +316,8 @@ class ODTE_Options_Research(QCAlgorithm):
                     return  # Exit after liquidation
 
                 # Recalculate EV with adjusted payoff function
-                degrees_of_freedom, mean, scale = self.param_dict.get(self.Time.hour, (2.0658, 0.0120, 0.2170))
-                p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, self.position.atm_strike)
+                degrees_of_freedom, mean, scale = self.param_dict[self.Time.hour]
+                p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
                 curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, self.position.payoff)
                 if curr_EV < 0:
                     self.Debug(f"Closing position entered at {self.position.entry_time} due to low EV")
@@ -336,7 +334,7 @@ class ODTE_Options_Research(QCAlgorithm):
             return
 
         expiry = max([x.Expiry for x in chain])
-        atm_strike = sorted(chain, key=lambda x: abs(x.Strike - chain.Underlying.Price))[0].Strike
+        #atm_strike = sorted(chain, key=lambda x: abs(x.Strike - chain.Underlying.Price))[0].Strike
         wing_spread_pct = self.set_wing_spread(self.Time.hour)
         closest_otm_put_strike, closest_otm_call_strike = self.select_wing_spreads(chain, atm_strike, wing_spread_pct)
 
@@ -362,10 +360,8 @@ class ODTE_Options_Research(QCAlgorithm):
             self.Debug(f"EV is negative at {curr_EV}, no trade placed")
             return
 
-        self.Debug(f"Wing spread: ATM Strike: {atm_strike}, OTM Put: {closest_otm_put_strike}, OTM Call: {closest_otm_call_strike}, IV/HV Ratio: {iv_hv_ratio:.2f}")
         #self.Debug(f"Payoff func (atm, put, call): {position.payoff(atm_strike)}, {position.payoff(closest_otm_put_strike)}, {position.payoff(closest_otm_call_strike)}")
-        self.Debug(f"Premium: {position.net_premium_received}, Loss: {position.max_loss * self.stop_loss_ratio}")
-        self.Debug(f"EV of trade is {curr_EV}")
+        #self.Debug(f"Premium: {position.net_premium_received}, Loss: {position.max_loss * self.stop_loss_ratio}")
         loss = adjusted_max_loss
         win = (curr_EV - loss * (1 - self.confidence)) / self.confidence
 
@@ -376,7 +372,9 @@ class ODTE_Options_Research(QCAlgorithm):
         no_trades = int((capital_risked_pct * self.Portfolio.TotalPortfolioValue) / (loss / self.stop_loss_ratio))
         if no_trades == 0:
             return
+        self.Debug(f"Wing spread: ATM Strike: {atm_strike}, OTM Put: {closest_otm_put_strike}, OTM Call: {closest_otm_call_strike}, IV/HV Ratio: {iv_hv_ratio:.2f}")
         self.Debug(f"Capital risked percentage is {capital_risked_pct*100} %")
+        self.Debug(f"EV of trade is {curr_EV}")
         self.Debug(f"Total portfolio cash before entering: {self.Portfolio.Cash}")
         self.Buy(position.iron_butterfly, no_trades)
         self.Debug(f"Total portfolio cash after entering: {self.Portfolio.Cash}, number of trades placed: {no_trades}, premium: {position.net_premium_received}")
@@ -388,4 +386,3 @@ class ODTE_Options_Research(QCAlgorithm):
             self.Liquidate()
             self.position = None
             self.Debug(f"Total portfolio value after liquidating at end of day: {self.Portfolio.TotalPortfolioValue}")
-
