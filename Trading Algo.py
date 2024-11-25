@@ -47,8 +47,8 @@ class ODTE_Options_Research(QCAlgorithm):
         
         # Parameters
         self.confidence = 0.97
-        self.kelly_norm_factor = 1/2
-        self.stop_loss_ratio = 1/2  # Adjust as needed
+        self.kelly_norm_factor = 1/5
+        self.stop_loss_ratio = 1/5  # Adjust as needed
         self.param_dict = {
             10: (1.9241292728, 0.0001579174, 0.0049384812),
             11: (2.6729722498, 0.0003478702, 0.0047362132),
@@ -92,47 +92,70 @@ class ODTE_Options_Research(QCAlgorithm):
         hv = np.std(returns) * (252 ** 0.5)  # Annualized volatility
         return hv
 
-    def set_wing_spread(self, time):
+    def select_best_iron_butterfly(self, chain, atm_strike):
         """
-        Determines the wing spread based on predefined parameters for different times.
+        Constructs multiple iron butterfly positions with varying wing spreads,
+        calculates the expected value for each, and returns the one with the highest EV.
         """
-        degrees_of_freedom, mean, scale = self.param_dict.get(time)
-        return self.t_distribution_spread(degrees_of_freedom, mean, scale, 100 * self.confidence)
+        expiry = max([x.Expiry for x in chain])
+        # Get available strikes
+        available_strikes = sorted(set([contract.Strike for contract in chain]))
+        # Determine possible symmetric wing spreads
+        distances = [strike - atm_strike for strike in available_strikes]
+        positive_distances = sorted(set([d for d in distances if d > 0]))
+        possible_wing_spreads = [d for d in positive_distances if -d in distances]
+        degrees_of_freedom, mean, scale = self.param_dict[self.Time.hour]
+        p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
 
-    def select_wing_spreads(self, chain, atm_strike, wing_spread_pct, epsilon=0.5):
-        """
-        Selects symmetric strike prices for an iron butterfly strategy.
-        """
-        calls = [i for i in chain if i.Right == OptionRight.Call]
-        puts = [i for i in chain if i.Right == OptionRight.Put]
-        if not calls or not puts:
-            self.Debug("No calls or puts found.")
+        if not possible_wing_spreads:
+            self.Debug("No symmetric wing spreads available.")
             return None, None
 
-        available_put_strikes = [x.Strike for x in puts]
-        available_call_strikes = [x.Strike for x in calls]
-
-        wing_spread = wing_spread_pct * atm_strike
-        valid_put_strikes = [
-            strike for strike in available_put_strikes
-            if abs(strike - (atm_strike - wing_spread)) <= epsilon
-        ]
-        valid_call_strikes = [
-            strike for strike in available_call_strikes
-            if abs(strike - (atm_strike + wing_spread)) <= epsilon
-        ]
-        symmetric_strikes = [
-            (put, call) for put in valid_put_strikes for call in valid_call_strikes
-            if abs(put - atm_strike) == abs(call - atm_strike)
-        ]
-        if not symmetric_strikes:
-            self.Debug("No symmetric strikes found within the epsilon range.")
+        num_spreads = min(5, len(possible_wing_spreads))
+        if num_spreads < 1:
+            self.Debug("Not enough wing spreads available.")
             return None, None
-        closest_symmetric_pair = min(
-            symmetric_strikes,
-            key=lambda pair: abs(pair[0] - (atm_strike - wing_spread))
-        )
-        return closest_symmetric_pair
+        # Evenly select wing spreads from the possible ones
+        indices = np.linspace(0, len(possible_wing_spreads) - 1, num_spreads).astype(int)
+        wing_spreads = [possible_wing_spreads[i] for i in indices]
+        #self.Debug(f"possible wing spreads: {wing_spreads}")
+        best_ev = float('-inf')
+        best_position = None
+
+        for wing_spread in wing_spreads:
+            target_put_strike = atm_strike - wing_spread
+            target_call_strike = atm_strike + wing_spread
+            # Find the closest available strikes to the target strikes
+            put_strikes = [s for s in available_strikes if s <= target_put_strike]
+            call_strikes = [s for s in available_strikes if s >= target_call_strike]
+            if not put_strikes or not call_strikes:
+                continue
+            closest_put = max(put_strikes)
+            closest_call = min(call_strikes)
+            # Ensure symmetry
+            if abs(closest_put - atm_strike) != abs(closest_call - atm_strike):
+                continue
+            iron_butterfly = OptionStrategies.IronButterfly(
+                self._symbol, closest_put, atm_strike, closest_call, expiry
+            )
+            position = self.compute_iron_butterfly_metrics(iron_butterfly, chain, atm_strike)
+            if not position:
+                continue
+            curr_ev = self.calculate_EV(p_deg_freedom, p_mean, p_scale, position.payoff)
+            # Print premiums and strikes for debugging
+            # self.Debug(f"Wing spread {wing_spread}, EV is {curr_ev}")
+            # self.Debug(f"selected {closest_put} and {closest_call} with atm being {atm_strike}, diff is {atm_strike - closest_put}")
+            # #check payoff func
+            # self.Debug(f"net premium: {position.net_premium_received}, max_loss is: {position.max_loss}")
+            if curr_ev > best_ev:
+                best_ev = curr_ev
+                best_position = position
+
+        if best_position and best_ev > 0:
+            return best_position, best_ev
+        else:
+            self.Debug("No suitable iron butterfly position found.")
+            return None, None
 
     class Position:
         def __init__(self, iron_butterfly, chain, net_premium_received, max_loss, m, fee,
@@ -194,10 +217,9 @@ class ODTE_Options_Research(QCAlgorithm):
             x3 = (y3 - y1) / m + x1
             return x3, 2*x1-x3
 
-
     def compute_iron_butterfly_metrics(self, iron_butterfly, chain, atm_strike):
         m = 100  # Contract multiplier for options
-        fee = 0.6  # Set fees according to your brokerage model
+        fee = 0.4  # Set fees according to your brokerage model
         # Initialize variables to store option premiums and strikes
         C_0_ATM = P_0_ATM = C_0_OTM = P_0_OTM = None
         K_C_ATM = K_P_ATM = K_C_OTM = K_P_OTM = None
@@ -283,7 +305,7 @@ class ODTE_Options_Research(QCAlgorithm):
         # Approximate expected value using numerical integration
         lb = 0.001
         ub = 1 - lb
-        x = np.linspace(distribution.ppf(lb), distribution.ppf(ub), 1000)
+        x = np.linspace(distribution.ppf(lb), distribution.ppf(ub), 5000)
         #self.Debug(f"Calculating EV from {distribution.ppf(lb)} to {distribution.ppf(ub)}")
         pdf = distribution.pdf(x)
         EV = np.sum(payoff(x) * pdf * (x[1] - x[0]))
@@ -339,29 +361,17 @@ class ODTE_Options_Research(QCAlgorithm):
         percentile = np.percentile(self.running_window, iv_hv_lower_bound)
         if iv_hv_ratio < percentile:
             return
-
-        expiry = max([x.Expiry for x in chain])
-        #atm_strike = sorted(chain, key=lambda x: abs(x.Strike - chain.Underlying.Price))[0].Strike
-        wing_spread_pct = self.set_wing_spread(self.Time.hour)
-        closest_otm_put_strike, closest_otm_call_strike = self.select_wing_spreads(chain, atm_strike, wing_spread_pct)
-
-        if closest_otm_put_strike is None or closest_otm_call_strike is None:
-            return
         
-        iron_butterfly = OptionStrategies.IronButterfly(
-            self._symbol, closest_otm_put_strike, atm_strike, closest_otm_call_strike, expiry
-        )
-
-        position = self.compute_iron_butterfly_metrics(iron_butterfly, chain, atm_strike)
-        if position is None:
+        best_position, best_ev = self.select_best_iron_butterfly(chain, atm_strike)
+        if best_position is None:
             return
-
-        degrees_of_freedom, mean, scale = self.param_dict.get(self.Time.hour, (2.0658, 0.0120, 0.2170))
-        p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
 
         # Adjusted max_loss for Kelly criterion
+        position = best_position
         adjusted_max_loss = position.stop_loss
         # Recalculate EV with adjusted payoff function
+        degrees_of_freedom, mean, scale = self.param_dict[self.Time.hour]
+        p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
         curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, position.payoff)
         if curr_EV < 0:
             #self.Debug(f"EV is negative at {curr_EV}, no trade placed")
@@ -378,8 +388,8 @@ class ODTE_Options_Research(QCAlgorithm):
         no_trades = int((capital_risked_pct * self.Portfolio.TotalPortfolioValue) / (loss / self.stop_loss_ratio))
         if no_trades == 0:
             return
-        self.Debug(f"Wing spread: ATM Strike: {atm_strike}, OTM Put: {closest_otm_put_strike}, OTM Call: {closest_otm_call_strike}, IV/HV Ratio: {iv_hv_ratio:.2f}")
-        self.Debug(f"Max Loss reached at otm put and call: {position.payoff(closest_otm_put_strike)}, {position.payoff(closest_otm_call_strike)}")
+        self.Debug(f"Wing spread: ATM Strike: {atm_strike}, OTM Put: {position.K_P_OTM}, OTM Call: {position.K_C_OTM}, IV/HV Ratio: {iv_hv_ratio:.2f}")
+        self.Debug(f"Max Loss reached at otm put and call: {position.payoff(position.K_P_OTM)}, {position.payoff(position.K_C_OTM)}")
         self.Debug(f"Stop Loss bounds are: {position.lower_bound}, {position.upper_bound}, with val: {position.payoff(position.upper_bound)}")
         self.Debug(f"Break-even bounds are: {position.lower_break_even}, {position.upper_break_even}, with val: {position.payoff(position.lower_break_even)}")
         self.Debug(f"Premium: {position.net_premium_received}, Stop Loss: {position.stop_loss}, Pre-Stop loss: {position.max_loss}")
@@ -394,5 +404,3 @@ class ODTE_Options_Research(QCAlgorithm):
             self.Liquidate()
             self.position = None
             self.Debug(f"Total portfolio value after liquidating at end of day: {self.Portfolio.TotalPortfolioValue}")
-
-#also, find breakeven points, and set the function to that new data
