@@ -1,3 +1,4 @@
+
 #next steps: 
 # if transaction cost = loss => close?
 # if volatility go up, then long iron butterfly
@@ -31,11 +32,11 @@ class ODTE_Options_Research(QCAlgorithm):
         option.SetFilter(self._filter)
 
         # Running window for price data
-        self.lookback_period = 30  # Lookback period for historical volatility
+        self.lookback_period = 3  # Lookback period for historical volatility
         self.price_window = deque(maxlen=self.lookback_period)
 
         # Running window for IV/HV ratios
-        self.window_len = 300
+        self.window_len = 5
         self.running_window = deque(maxlen=self.window_len)
 
         # Warm-up period for sufficient data collection
@@ -156,7 +157,10 @@ class ODTE_Options_Research(QCAlgorithm):
             self.stop_loss_ratio = stop_loss_ratio
             self.stop_loss = self.stop_loss_ratio * self.max_loss
             # Calculate price bounds for stop loss
-            self.lower_bound, self.upper_bound = self.calculate_price_bounds()
+            self.lower_bound, self.upper_bound = self.calculate_price_bounds(-self.stop_loss)
+            self.lower_break_even, self.upper_break_even = self.calculate_price_bounds(0)
+            if self.K_C_ATM != self.K_P_ATM:
+                self.Debug(f"?????")
 
         def payoff(self, S_T):
             # Option values at expiration
@@ -168,26 +172,28 @@ class ODTE_Options_Research(QCAlgorithm):
             # Original payoff calculation
             P_T = ((C_T_OTM + P_T_OTM - C_T_ATM - P_T_ATM -
                     (self.C_0_OTM + self.P_0_OTM - self.C_0_ATM - self.P_0_ATM)) * self.m) - self.fee
-
             # Adjust payoff for stop loss
             max_loss = -self.stop_loss  # Negative because loss is negative payoff
-            P_T = np.maximum(P_T, max_loss)
+            #P_T = np.maximum(P_T, max_loss)
 
             return P_T
 
-        def calculate_price_bounds(self):
+        def calculate_price_bounds(self, payoff_value):
             """
-            Calculate the SPY price bounds where the loss equals stop_loss.
+            Calculate the lower and upper bounds where the payoff equals the given value (e.g., stop-loss or break-even).
             """
-            # Since the iron butterfly payoff is symmetrical, we can find the price where the loss equals stop_loss
-            # We'll solve for S_T in the payoff equation where payoff = -stop_loss
+            x1 = self.K_C_ATM
+            x2 = self.K_P_OTM
+            y1 = self.net_premium_received
+            y2 = -self.max_loss
+            y3 = payoff_value
+            if x2 == x1:
+                raise ValueError("x1 and x2 cannot be the same; vertical line slope is undefined.")
+            m = (y2 - y1) / (x2 - x1)
+            # Calculate x3 based on y3
+            x3 = (y3 - y1) / m + x1
+            return x3, 2*x1-x3
 
-            # For the lower bound (S_T < K_P_OTM)
-            lower_bound = self.K_P_OTM - ((self.net_premium_received + self.stop_loss) / self.m)
-            # For the upper bound (S_T > K_C_OTM)
-            upper_bound = self.K_C_OTM + ((self.net_premium_received + self.stop_loss) / self.m)
-
-            return lower_bound, upper_bound
 
     def compute_iron_butterfly_metrics(self, iron_butterfly, chain, atm_strike):
         m = 100  # Contract multiplier for options
@@ -315,7 +321,8 @@ class ODTE_Options_Research(QCAlgorithm):
                     self.position = None
                     return  # Exit after liquidation
 
-                # Recalculate EV with adjusted payoff function
+                # Recalculate EV with adjusted payoff function. This is because payoff function for position stays same but price changes every hour:
+                # Thus, we have to recalculate EV every hour with new prob dist of price and old payoff
                 degrees_of_freedom, mean, scale = self.param_dict[self.Time.hour]
                 p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
                 curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, self.position.payoff)
@@ -350,18 +357,17 @@ class ODTE_Options_Research(QCAlgorithm):
             return
 
         degrees_of_freedom, mean, scale = self.param_dict.get(self.Time.hour, (2.0658, 0.0120, 0.2170))
-        p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, position.atm_strike)
+        p_deg_freedom, p_mean, p_scale = self.create_t_distribution(degrees_of_freedom, mean, scale, atm_strike)
 
         # Adjusted max_loss for Kelly criterion
         adjusted_max_loss = position.stop_loss
         # Recalculate EV with adjusted payoff function
         curr_EV = self.calculate_EV(p_deg_freedom, p_mean, p_scale, position.payoff)
         if curr_EV < 0:
-            self.Debug(f"EV is negative at {curr_EV}, no trade placed")
+            #self.Debug(f"EV is negative at {curr_EV}, no trade placed")
             return
 
         #self.Debug(f"Payoff func (atm, put, call): {position.payoff(atm_strike)}, {position.payoff(closest_otm_put_strike)}, {position.payoff(closest_otm_call_strike)}")
-        #self.Debug(f"Premium: {position.net_premium_received}, Loss: {position.max_loss * self.stop_loss_ratio}")
         loss = adjusted_max_loss
         win = (curr_EV - loss * (1 - self.confidence)) / self.confidence
 
@@ -373,11 +379,13 @@ class ODTE_Options_Research(QCAlgorithm):
         if no_trades == 0:
             return
         self.Debug(f"Wing spread: ATM Strike: {atm_strike}, OTM Put: {closest_otm_put_strike}, OTM Call: {closest_otm_call_strike}, IV/HV Ratio: {iv_hv_ratio:.2f}")
-        self.Debug(f"Capital risked percentage is {capital_risked_pct*100} %")
-        self.Debug(f"EV of trade is {curr_EV}")
-        self.Debug(f"Total portfolio cash before entering: {self.Portfolio.Cash}")
+        self.Debug(f"Max Loss reached at otm put and call: {position.payoff(closest_otm_put_strike)}, {position.payoff(closest_otm_call_strike)}")
+        self.Debug(f"Stop Loss bounds are: {position.lower_bound}, {position.upper_bound}, with val: {position.payoff(position.upper_bound)}")
+        self.Debug(f"Break-even bounds are: {position.lower_break_even}, {position.upper_break_even}, with val: {position.payoff(position.lower_break_even)}")
+        self.Debug(f"Premium: {position.net_premium_received}, Stop Loss: {position.stop_loss}, Pre-Stop loss: {position.max_loss}")
+        self.Debug(f"EV trade: {curr_EV}; Risking cpt_pct: {capital_risked_pct*100} %, at {no_trades} trades.")
+        self.Debug(f"Trade placed at {self.time}")
         self.Buy(position.iron_butterfly, no_trades)
-        self.Debug(f"Total portfolio cash after entering: {self.Portfolio.Cash}, number of trades placed: {no_trades}, premium: {position.net_premium_received}")
         self.position = position  # Keep track of the active position
 
     def OnEndOfDay(self, symbol: Symbol) -> None:
@@ -386,3 +394,5 @@ class ODTE_Options_Research(QCAlgorithm):
             self.Liquidate()
             self.position = None
             self.Debug(f"Total portfolio value after liquidating at end of day: {self.Portfolio.TotalPortfolioValue}")
+
+#also, find breakeven points, and set the function to that new data
