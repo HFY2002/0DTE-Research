@@ -18,6 +18,8 @@
 # self.Debug(f"Underlying Prices: {underlying_prices_int}")
 # self.Debug(f"Payoff Values: {payoff_values}")
 
+#Question: what does quantbook do with liquidation at 16:00?
+
 
 from AlgorithmImports import *
 from scipy import stats
@@ -49,13 +51,14 @@ class ODTE_Options_Research(QCAlgorithm):
         self.kelly_norm_factor = 1
         self.stop_loss_ratio = 1  # Adjust as needed
         self.capital_before_investment = None
+        self.no_trades = None
         self.param_dict = {
-            10: (1.9241292728, 0.0001579174, 0.0049384812),
-            11: (2.6729722498, 0.0003478702, 0.0047362132),
-            12: (1.8960267740, 0.0002372966, 0.0037117045),
-            13: (2.2975703292, 0.0002469925, 0.0035227054),
-            14: (1.9214315186, 0.0001726382, 0.0028405084),
-            15: (1.9448810028, 0.0001112350, 0.0021241173)
+            10: (2.6919676639088532, 0.0005309834758547001, 0.005187973392625497),
+            11: (2.45935445274916, 0.00047545495802637583, 0.004290066437038121),
+            12: (1.8730134231612623, 0.00030047146446993426, 0.0034277997022314245),
+            13: (1.8760251263220549, 0.00029422672233981716, 0.0030622330062556958),
+            14: (1.89343793022821, 0.00024803667549057817, 0.002602885517628698),
+            15: (1.9734008826364353, 0.000035561218106801466, 0.0019824631710342266),
         }
 
         self.position = None  # Initialize with no active position
@@ -181,7 +184,7 @@ class ODTE_Options_Research(QCAlgorithm):
 
         def curr_payoff(self, iron_butterfly_prem_per_underlying_asset):
             # Original payoff calculation
-            P_T = ((self.net_premium_received_per_underlying_asset - iron_butterfly_prem_per_underlying_asset) * self.m) - self.fee - 2 #-2 since it works for some reason
+            P_T = ((self.net_premium_received_per_underlying_asset - iron_butterfly_prem_per_underlying_asset) * self.m) - self.fee 
             # Adjust payoff for stop loss
             P_T = np.maximum(P_T, -self.stop_loss) # Negative because loss is negative payoff
 
@@ -349,7 +352,7 @@ class ODTE_Options_Research(QCAlgorithm):
                     self.Debug(f"Closing position entered at {self.position.entry_time} because of stop loss.")
                     self.Liquidate()
                     self.position = None
-                    pnl = self.capital_before_investment - self.Portfolio.TotalPortfolioValue
+                    pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
                     self.Debug(f"return is {pnl}") 
                     return  # Exit after liquidation
                 # Recalculate EV with adjusted payoff function. This is because payoff function for position stays same but price changes every hour:
@@ -362,12 +365,13 @@ class ODTE_Options_Research(QCAlgorithm):
                 p_deg_freedom, p_mean, p_scale = self.create_t_distribution(chain.underlying.price)
                 EV_of_expiry_profit = self.calculate_EV(p_deg_freedom, p_mean, p_scale, self.position.expiry_payoff)
                 #compare expiry EV to profit if exit now:
-                if EV_of_expiry_profit < exit_profit*0.8:
-                    self.Debug(f"Closing position entered at {self.position.entry_time} to lock in profit of {exit_profit}.")
+                if exit_profit > 0:# or (EV_of_expiry_profit < exit_profit*0.8):
+                    self.Debug(f"Closing position entered at {self.position.entry_time} to lock in profit of {exit_profit*self.no_trades}.")
                     self.Liquidate()
                     self.position = None
+                    self.no_trades = None
                     
-                    pnl = self.capital_before_investment - self.Portfolio.TotalPortfolioValue
+                    pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
                     self.Debug(f"return is {pnl}") 
             return  #do not enter new positions
 
@@ -381,7 +385,7 @@ class ODTE_Options_Research(QCAlgorithm):
         if position is None:
             return
         win_chance = self.probability_between_bounds(position.lower_break_even, position.upper_break_even, chain.underlying.price)
-        if win_chance < 0.5 or EV_of_expiry_profit < 5:
+        if win_chance < 0.3 or EV_of_expiry_profit < 0:
             return
 
         # Adjusted max_loss for Kelly criterion
@@ -392,22 +396,22 @@ class ODTE_Options_Research(QCAlgorithm):
         capital_risked_pct = ((win_chance*win_amount) - ((1-win_chance)*(loss_amount)))/(win_amount*loss_amount)
         # Regularize and cap at 15% for risk management, and prevent % from being zero
         capital_risked_pct = max(0, min(capital_risked_pct * self.kelly_norm_factor, 0.15))
-        no_trades = min(100, int((capital_risked_pct * self.Portfolio.TotalPortfolioValue) / (position.stop_loss)))
+        no_trades = min(100, int((capital_risked_pct * self.Portfolio.TotalPortfolioValue) / (position.stop_loss))) + 1
 
         if no_trades <= 0:
             return
         # self.Debug(f"Wing spread: ATM Strike: {atm_strike}, OTM Put: {position.K_P_OTM}, OTM Call: {position.K_C_OTM}, IV/HV Ratio: {iv_hv_ratio:.2f}")
         # self.Debug(f"Max Loss reached at otm put and call: {position.expiry_payoff(position.K_P_OTM)}, {position.expiry_payoff(position.K_C_OTM)}")
         # self.Debug(f"Stop Loss bounds are: {position.lower_bound}, {position.upper_bound}, with val: {position.expiry_payoff(position.upper_bound)}")
-        # self.Debug(f"Break-even bounds are: {position.lower_break_even}, {position.upper_break_even}, with val: {int(position.expiry_payoff(position.lower_break_even))}, win chance {win_chance}")
+        self.Debug(f"Break-even bounds are: {position.lower_break_even}, {position.upper_break_even}, with val: {int(position.expiry_payoff(position.lower_break_even))}, win chance {win_chance}")
         # self.Debug(f"Premium: {position.max_profit}, Stop Loss: {-position.stop_loss}")
         # self.Debug(f"EV trade: {EV_of_expiry_profit}; Risking cpt_pct: {capital_risked_pct*100} %, at {no_trades} trades.")
         
         self.Debug(f"pct of winning {100*win_chance}%, EV is {EV_of_expiry_profit}, capital_risked_pct is {capital_risked_pct} with trades {no_trades}")
         self.Debug(f"Trade placed at {self.time}")
-        no_trades = 1
         self.capital_before_investment = self.Portfolio.TotalPortfolioValue
         self.Buy(position.iron_butterfly, no_trades)
+        self.no_trades = no_trades
         self.position = position  # Keep track of the active position
 
     def OnEndOfDay(self, symbol: Symbol) -> None:
@@ -415,5 +419,6 @@ class ODTE_Options_Research(QCAlgorithm):
             self.Debug(f"liquidate at end of day")
             self.Liquidate()
             self.position = None
-            pnl = self.capital_before_investment - self.Portfolio.TotalPortfolioValue
+            pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
             self.Debug(f"return is {pnl}") 
+
