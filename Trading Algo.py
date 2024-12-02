@@ -30,7 +30,7 @@ from scipy.stats import t
 class ODTE_Options_Research(QCAlgorithm):
 
     def Initialize(self):
-        self.SetStartDate(2023, 1, 1)
+        self.SetStartDate(2023, 5, 1)
         self.SetCash(1000000)
 
         # Add SPY option data with hourly resolution
@@ -38,10 +38,10 @@ class ODTE_Options_Research(QCAlgorithm):
         self._symbol = option.Symbol
         option.SetFilter(self._filter)
         # Running window for price data
-        self.lookback_period = 3  # Lookback period for historical volatility
+        self.lookback_period = 30  # Lookback period for historical volatility
         self.price_window = deque(maxlen=self.lookback_period)
         # Running window for IV/HV ratios
-        self.window_len = 5
+        self.window_len = 200
         self.running_window = deque(maxlen=self.window_len)
         # Warm-up period for sufficient data collection
         self.SetWarmUp(self.window_len, Resolution.Hour)
@@ -49,7 +49,7 @@ class ODTE_Options_Research(QCAlgorithm):
         self.spy = self.AddEquity("SPY", Resolution.Hour).Symbol
         # Parameters
         self.kelly_norm_factor = 1
-        self.stop_loss_ratio = 1  # Adjust as needed
+        self.stop_loss_ratio = 1/2  # Adjust as needed
         self.capital_before_investment = None
         self.no_trades = None
         self.param_dict = {
@@ -62,6 +62,9 @@ class ODTE_Options_Research(QCAlgorithm):
         }
 
         self.position = None  # Initialize with no active position
+        self.profit_from_exit = 0
+        self.profit_from_expiry = 0
+        self.invested = False
 
     def _filter(self, universe):
         """
@@ -341,10 +344,17 @@ class ODTE_Options_Research(QCAlgorithm):
         else:
             return
 
-        if self.IsWarmingUp or self.Time.hour in [10, 11, 12, 16]:
+        if self.IsWarmingUp or self.Time.hour in [16]:
             return
+        #quantconnect continues calcualting options payoffs even after they expire and are exercised, so we need to manually remove them
+        if self.time.hour == 10:
+            self.Liquidate()
+            self.position = None
+            self.invested = False
 
-        if self.Portfolio.Invested:
+
+
+        if self.invested:
             if self.position is not None:
                 # Implement stop loss check
                 current_price = self.Securities[self.spy].Price
@@ -352,6 +362,8 @@ class ODTE_Options_Research(QCAlgorithm):
                     self.Debug(f"Closing position entered at {self.position.entry_time} because of stop loss.")
                     self.Liquidate()
                     self.position = None
+                    self.invested = False
+                    self.no_trades = None
                     pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
                     self.Debug(f"return is {pnl}") 
                     return  # Exit after liquidation
@@ -365,14 +377,15 @@ class ODTE_Options_Research(QCAlgorithm):
                 p_deg_freedom, p_mean, p_scale = self.create_t_distribution(chain.underlying.price)
                 EV_of_expiry_profit = self.calculate_EV(p_deg_freedom, p_mean, p_scale, self.position.expiry_payoff)
                 #compare expiry EV to profit if exit now:
-                if exit_profit > 0:# or (EV_of_expiry_profit < exit_profit*0.8):
+                if (EV_of_expiry_profit*0.7 < exit_profit):
                     self.Debug(f"Closing position entered at {self.position.entry_time} to lock in profit of {exit_profit*self.no_trades}.")
                     self.Liquidate()
                     self.position = None
+                    self.invested = False
                     self.no_trades = None
-                    
                     pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
-                    self.Debug(f"return is {pnl}") 
+                    self.profit_from_exit += pnl
+                    #self.Debug(f"return is {pnl}, net return from exiting is {self.profit_from_exit}") 
             return  #do not enter new positions
 
         iv_hv_ratio = avg_iv / historical_volatility
@@ -385,7 +398,7 @@ class ODTE_Options_Research(QCAlgorithm):
         if position is None:
             return
         win_chance = self.probability_between_bounds(position.lower_break_even, position.upper_break_even, chain.underlying.price)
-        if win_chance < 0.3 or EV_of_expiry_profit < 0:
+        if win_chance < 0.5 or EV_of_expiry_profit < 10:
             return
 
         # Adjusted max_loss for Kelly criterion
@@ -403,7 +416,7 @@ class ODTE_Options_Research(QCAlgorithm):
         # self.Debug(f"Wing spread: ATM Strike: {atm_strike}, OTM Put: {position.K_P_OTM}, OTM Call: {position.K_C_OTM}, IV/HV Ratio: {iv_hv_ratio:.2f}")
         # self.Debug(f"Max Loss reached at otm put and call: {position.expiry_payoff(position.K_P_OTM)}, {position.expiry_payoff(position.K_C_OTM)}")
         # self.Debug(f"Stop Loss bounds are: {position.lower_bound}, {position.upper_bound}, with val: {position.expiry_payoff(position.upper_bound)}")
-        self.Debug(f"Break-even bounds are: {position.lower_break_even}, {position.upper_break_even}, with val: {int(position.expiry_payoff(position.lower_break_even))}, win chance {win_chance}")
+        # self.Debug(f"Break-even bounds are: {position.lower_break_even}, {position.upper_break_even}, with val: {int(position.expiry_payoff(position.lower_break_even))}, win chance {win_chance}")
         # self.Debug(f"Premium: {position.max_profit}, Stop Loss: {-position.stop_loss}")
         # self.Debug(f"EV trade: {EV_of_expiry_profit}; Risking cpt_pct: {capital_risked_pct*100} %, at {no_trades} trades.")
         
@@ -411,14 +424,16 @@ class ODTE_Options_Research(QCAlgorithm):
         self.Debug(f"Trade placed at {self.time}")
         self.capital_before_investment = self.Portfolio.TotalPortfolioValue
         self.Buy(position.iron_butterfly, no_trades)
+        self.invested = True
         self.no_trades = no_trades
         self.position = position  # Keep track of the active position
 
-    def OnEndOfDay(self, symbol: Symbol) -> None:
-        if self.position is not None:
-            self.Debug(f"liquidate at end of day")
-            self.Liquidate()
-            self.position = None
-            pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
-            self.Debug(f"return is {pnl}") 
-
+    # def OnEndOfDay(self, symbol: Symbol) -> None:
+    #     self.invested = False
+        # if self.position is not None:
+        #     self.Debug(f"liquidate at end of day, position entered at {self.position.entry_time.hour}")
+        #     self.Liquidate()
+        #     self.position = None
+        #     pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
+        #     self.profit_from_expiry += pnl
+        #     self.Debug(f"return is {pnl}, net return from expiry is {self.profit_from_expiry}")
