@@ -1,26 +1,3 @@
-
-#next steps: 
-
-#do research into historical diff between implied and realized vol: build different thresholds for different market conditions
-#look at event buffers
-
-    #WORK TO BE DONE
-    #   a) search documentaion
-
-    #FIND WAY TO CALCULATE LIQUIDSTED PFORIT
-    #and handle margin calls
-#Clean code for plotting:
-# underlying_prices = np.linspace(self.position.K_P_OTM - 5, self.position.K_C_OTM + 5, 20)
-# underlying_prices_int = [int(price) for price in underlying_prices]
-# payoff_values = [int(self.position.expiry_payoff(price)) for price in underlying_prices_int]
-# self.Debug(f"Original Premium is: {self.position.max_profit}")
-# # Print the underlying prices and their corresponding payoff values
-# self.Debug(f"Underlying Prices: {underlying_prices_int}")
-# self.Debug(f"Payoff Values: {payoff_values}")
-
-#Question: what does quantbook do with liquidation at 16:00?
-
-
 from AlgorithmImports import *
 from scipy import stats
 from collections import deque
@@ -37,19 +14,24 @@ class ODTE_Options_Research(QCAlgorithm):
         option = self.AddOption('SPY', Resolution.Hour)
         self._symbol = option.Symbol
         option.SetFilter(self._filter)
+
         # Running window for price data
-        self.lookback_period = 30  # Lookback period for historical volatility
+        self.lookback_period = 65  # Lookback period for historical volatility
         self.price_window = deque(maxlen=self.lookback_period)
+
         # Running window for IV/HV ratios
         self.window_len = 200
         self.running_window = deque(maxlen=self.window_len)
+
         # Warm-up period for sufficient data collection
         self.SetWarmUp(self.window_len, Resolution.Hour)
+
         # Add SPY equity data
         self.spy = self.AddEquity("SPY", Resolution.Hour).Symbol
+
         # Parameters
         self.kelly_norm_factor = 1
-        self.stop_loss_ratio = 1/2  # Adjust as needed
+        self.stop_loss_ratio = 0.5  # Stop loss at 50%
         self.capital_before_investment = None
         self.no_trades = None
         self.param_dict = {
@@ -64,6 +46,7 @@ class ODTE_Options_Research(QCAlgorithm):
         self.position = None  # Initialize with no active position
         self.profit_from_exit = 0
         self.profit_from_expiry = 0
+        self.portfolio.set_margin_call_model(DefaultMarginCallModel(self.portfolio, self.default_order_properties))
         self.invested = False
 
     def _filter(self, universe):
@@ -112,7 +95,6 @@ class ODTE_Options_Research(QCAlgorithm):
         possible_wing_spreads = [d for d in positive_distances if -d in distances]
         p_deg_freedom, p_mean, p_scale = self.create_t_distribution(chain.underlying.price)
 
-
         if not possible_wing_spreads:
             self.Debug("No symmetric wing spreads available.")
             return None, None
@@ -121,6 +103,7 @@ class ODTE_Options_Research(QCAlgorithm):
         if num_spreads < 1:
             self.Debug("Not enough wing spreads available.")
             return None, None
+
         # Evenly select wing spreads from the possible ones
         indices = np.linspace(0, len(possible_wing_spreads) - 1, num_spreads).astype(int)
         wing_spreads = [possible_wing_spreads[i] for i in indices]
@@ -147,11 +130,6 @@ class ODTE_Options_Research(QCAlgorithm):
             if not position:
                 continue
             curr_ev = self.calculate_EV(p_deg_freedom, p_mean, p_scale, position.expiry_payoff)
-            # Print premiums and strikes for debugging
-            # self.Debug(f"Wing spread {wing_spread}, EV is {curr_ev}")
-            # self.Debug(f"selected {closest_put} and {closest_call} with atm being {atm_strike}, diff is {atm_strike - closest_put}")
-            # #check payoff func
-            # self.Debug(f"net premium: {position.net_premium_received}, max_loss is: {position.max_loss}")
             if curr_ev > best_ev:
                 best_ev = curr_ev
                 best_position = position
@@ -159,7 +137,6 @@ class ODTE_Options_Research(QCAlgorithm):
         if best_position and best_ev > 0:
             return best_position, best_ev
         else:
-            #self.Debug("No suitable iron butterfly position found.")
             return None, None
 
     class Position:
@@ -180,7 +157,7 @@ class ODTE_Options_Research(QCAlgorithm):
             self.atm_strike = atm_strike
             self.entry_time = entry_time
             self.stop_loss_ratio = stop_loss_ratio
-            self.stop_loss = self.stop_loss_ratio*(self.max_loss-self.fee) + self.fee # is positive, needs to mult*-1 be be actual payoff val
+            self.stop_loss = self.stop_loss_ratio*(self.max_loss - self.fee) + self.fee # 50% stop loss
             # Calculate price bounds for stop loss
             self.lower_bound, self.upper_bound = self.calculate_price_bounds(-self.stop_loss)
             self.lower_break_even, self.upper_break_even = self.calculate_price_bounds(0)
@@ -190,7 +167,6 @@ class ODTE_Options_Research(QCAlgorithm):
             P_T = ((self.net_premium_received_per_underlying_asset - iron_butterfly_prem_per_underlying_asset) * self.m) - self.fee 
             # Adjust payoff for stop loss
             P_T = np.maximum(P_T, -self.stop_loss) # Negative because loss is negative payoff
-
             return P_T
 
         def expiry_payoff(self, x):
@@ -201,7 +177,6 @@ class ODTE_Options_Research(QCAlgorithm):
             P_T_ATM = np.maximum(self.K_P_ATM - x, 0)
             # Iron butterfly premium per underlying asset
             iron_butterfly_prem_per_underlying_asset = (C_T_ATM + P_T_ATM) - (C_T_OTM + P_T_OTM)
-            # Calculate exact payoff using the exact_payoff function
             return self.curr_payoff(iron_butterfly_prem_per_underlying_asset)
 
         def calculate_price_bounds(self, payoff_value):
@@ -221,7 +196,7 @@ class ODTE_Options_Research(QCAlgorithm):
             return x3, 2*x1-x3
 
     def iron_butterfly_prem_per_underlying_asset(self, iron_butterfly, chain, enter):
-        #enter True => we are calculating the premium we get from opening position. Else, it means premium we have pay to exit the position.
+        # enter True => we are calculating the premium we get from opening position. Else, premium we pay to exit.
         C_ATM = P_ATM = C_OTM = P_OTM = None
         for leg in iron_butterfly.OptionLegs:
             contract = next(
@@ -240,7 +215,7 @@ class ODTE_Options_Research(QCAlgorithm):
                     option_price = contract.AskPrice
                 else:
                     option_price = contract.BidPrice
-            # Map premiums and strikes based on leg type
+
             if leg.Quantity == -1 and leg.Right == OptionRight.Call:
                 C_ATM = option_price
             elif leg.Quantity == -1 and leg.Right == OptionRight.Put:
@@ -249,6 +224,7 @@ class ODTE_Options_Research(QCAlgorithm):
                 C_OTM = option_price
             elif leg.Quantity == 1 and leg.Right == OptionRight.Put:
                 P_OTM = option_price
+
         if None in [C_ATM, P_ATM, C_OTM, P_OTM]:
             return None
 
@@ -257,32 +233,31 @@ class ODTE_Options_Research(QCAlgorithm):
     def compute_iron_butterfly_metrics(self, iron_butterfly, chain, atm_strike):
         m = 100  # Contract multiplier for options
         fee = 4  # Set fees according to your brokerage model
-        # Initialize variables to store option premiums and strikes
+
         K_C_ATM = K_P_ATM = K_C_OTM = K_P_OTM = None
         for leg in iron_butterfly.OptionLegs:
             contract = next((x for x in chain if x.Strike == leg.Strike and x.Right == leg.Right and x.Expiry.date() == leg.Expiration.date()), None)
             if contract is None:
                 continue
-            # Map premiums and strikes based on leg type
-            if leg.Quantity == -1 and leg.Right == OptionRight.Call: # Short position: Use bid price (money received)
+            if leg.Quantity == -1 and leg.Right == OptionRight.Call:
                 K_C_ATM = leg.Strike
-            elif leg.Quantity == -1 and leg.Right == OptionRight.Put: # Short position: Use bid price (money received)
+            elif leg.Quantity == -1 and leg.Right == OptionRight.Put:
                 K_P_ATM = leg.Strike
-            elif leg.Quantity == 1 and leg.Right == OptionRight.Call: # Long position: Use ask price (money paid)
+            elif leg.Quantity == 1 and leg.Right == OptionRight.Call:
                 K_C_OTM = leg.Strike
-            elif leg.Quantity == 1 and leg.Right == OptionRight.Put: # Long position: Use ask price (money paid)
+            elif leg.Quantity == 1 and leg.Right == OptionRight.Put:
                 K_P_OTM = leg.Strike
-        # Check if all necessary premiums and strikes are collected
+
         if None in [K_C_ATM, K_P_ATM, K_C_OTM, K_P_OTM]:
             return None
-        # Calculate net premium received (credit received at position opening)
-        net_premium_received_per_underlying_asset = self.iron_butterfly_prem_per_underlying_asset(iron_butterfly, chain, enter = True)
+
+        net_premium_received_per_underlying_asset = self.iron_butterfly_prem_per_underlying_asset(iron_butterfly, chain, enter=True)
+        if net_premium_received_per_underlying_asset is None:
+            return None
+
         max_profit = net_premium_received_per_underlying_asset*m - fee
-        # Wing width (difference between OTM and ATM strikes)
         wing_width = K_C_OTM - K_C_ATM
-        # Maximum loss (difference between wing width and net premium received, plus fees)
-        max_loss = ((wing_width - net_premium_received_per_underlying_asset) * m) + fee  # Positive; multiply by -1 for payoff
-        # Create Position object to store metrics
+        max_loss = ((wing_width - net_premium_received_per_underlying_asset) * m) + fee  
         position = self.Position(
             iron_butterfly=iron_butterfly,
             chain=chain,
@@ -304,23 +279,14 @@ class ODTE_Options_Research(QCAlgorithm):
     def probability_between_bounds(self, lb, ub, atm):
         new_degrees_of_freedom, new_mean, new_scale = self.create_t_distribution(atm)
         distribution = t(df=new_degrees_of_freedom, loc=new_mean, scale=new_scale)
-        # Calculate the probability between the bounds
         return distribution.cdf(ub) - distribution.cdf(lb)
 
     def create_t_distribution(self, atm):
-        """
-        Constructs the t-distribution for the final asset price given the % change distribution.
-        """
         degrees_of_freedom, mean, scale = self.param_dict[self.Time.hour]
         return degrees_of_freedom, atm*(1+mean), atm*scale
 
     def calculate_EV(self, new_degrees_of_freedom, new_mean, new_scale, payoff):
-        """
-        Calculates the expected value of the payoff function under the given distribution.
-        """
-        # Define the Student's t-distribution for the final price
         distribution = t(df=new_degrees_of_freedom, loc=new_mean, scale=new_scale)
-        # Approximate expected value using numerical integration
         lb = 0.001
         ub = 1 - lb
         x = np.linspace(distribution.ppf(lb), distribution.ppf(ub), 1000)
@@ -346,18 +312,16 @@ class ODTE_Options_Research(QCAlgorithm):
 
         if self.IsWarmingUp or self.Time.hour in [16]:
             return
-        #quantconnect continues calcualting options payoffs even after they expire and are exercised, so we need to manually remove them
-        if self.time.hour == 10:
+
+        if self.Time.hour == 10:
             self.Liquidate()
             self.position = None
             self.invested = False
 
-
-
         if self.invested:
             if self.position is not None:
-                # Implement stop loss check
                 current_price = self.Securities[self.spy].Price
+                # Stop loss check
                 if current_price <= self.position.lower_bound or current_price >= self.position.upper_bound:
                     self.Debug(f"Closing position entered at {self.position.entry_time} because of stop loss.")
                     self.Liquidate()
@@ -366,34 +330,34 @@ class ODTE_Options_Research(QCAlgorithm):
                     self.no_trades = None
                     pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
                     self.Debug(f"return is {pnl}") 
-                    return  # Exit after liquidation
-                # Recalculate EV with adjusted payoff function. This is because payoff function for position stays same but price changes every hour:
-                # Thus, we have to recalculate EV every hour with new prob dist of price and old payoff
-                iron_butterfly_prem_per_underlying_asset = self.iron_butterfly_prem_per_underlying_asset(self.position.iron_butterfly, chain, enter = False)
-                if iron_butterfly_prem_per_underlying_asset is None:
-                    self.Debug(f"BOO YOU FUCKED UP!!!!!!")
                     return
+
+                # Profit target check
+                # Calculate current profit if we exit now
+                iron_butterfly_prem_per_underlying_asset = self.iron_butterfly_prem_per_underlying_asset(self.position.iron_butterfly, chain, enter=False)
+                if iron_butterfly_prem_per_underlying_asset is None:
+                    self.Debug("Error in calculating current payoff.")
+                    return
+                
                 exit_profit = self.position.curr_payoff(iron_butterfly_prem_per_underlying_asset)
-                p_deg_freedom, p_mean, p_scale = self.create_t_distribution(chain.underlying.price)
-                EV_of_expiry_profit = self.calculate_EV(p_deg_freedom, p_mean, p_scale, self.position.expiry_payoff)
-                #compare expiry EV to profit if exit now:
-                if (EV_of_expiry_profit*0.7 < exit_profit):
-                    self.Debug(f"Closing position entered at {self.position.entry_time} to lock in profit of {exit_profit*self.no_trades}.")
+
+                # Check if exit profit meets 25% profit target
+                if exit_profit >= 0.25 * self.position.max_profit:
+                    self.Debug(f"Closing position entered at {self.position.entry_time} to lock in a 25% profit target.")
                     self.Liquidate()
                     self.position = None
                     self.invested = False
                     self.no_trades = None
                     pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
                     self.profit_from_exit += pnl
-                    #self.Debug(f"return is {pnl}, net return from exiting is {self.profit_from_exit}") 
-            return  #do not enter new positions
+            return
 
         iv_hv_ratio = avg_iv / historical_volatility
-        iv_hv_lower_bound = 50
+        iv_hv_lower_bound = 75
         percentile = np.percentile(self.running_window, iv_hv_lower_bound)
         if iv_hv_ratio < percentile:
             return
-        
+
         position, EV_of_expiry_profit = self.select_best_iron_butterfly(chain, atm_strike)
         if position is None:
             return
@@ -401,39 +365,43 @@ class ODTE_Options_Research(QCAlgorithm):
         if win_chance < 0.5 or EV_of_expiry_profit < 10:
             return
 
-        # Adjusted max_loss for Kelly criterion
-        adjusted_max_loss = position.stop_loss #this is positive
-        loss_amount = adjusted_max_loss
-        win_amount = (EV_of_expiry_profit + loss_amount*(1-win_chance))/win_chance
-        # Calculate Kelly Criterion Percent with adjusted max_loss
-        capital_risked_pct = ((win_chance*win_amount) - ((1-win_chance)*(loss_amount)))/(win_amount*loss_amount)
-        # Regularize and cap at 15% for risk management, and prevent % from being zero
-        capital_risked_pct = max(0, min(capital_risked_pct * self.kelly_norm_factor, 0.15))
-        no_trades = min(100, int((capital_risked_pct * self.Portfolio.TotalPortfolioValue) / (position.stop_loss))) + 1
+        # Calculate the adjusted maximum loss based on the position's stop loss
+        loss_amount = position.stop_loss
 
+        # Given the EV of expiry and the win probability, solve for the average win amount per winning scenario.
+        # The formula is derived as follows:
+        # EV_of_expiry_profit = p * (win_amount) - (1 - p) * (loss_amount)
+        # Rearranging for win_amount:
+        # win_amount = (EV_of_expiry_profit + loss_amount*(1 - p)) / p
+        win_amount = (EV_of_expiry_profit + loss_amount * (1 - win_chance)) / win_chance
+
+        # Calculate the Kelly fraction (capital_risked_pct) using a Kelly-like formula:
+        # Kelly fraction ≈ ((p * win) - ((1 - p) * loss)) / (win * loss)
+        # This gives the fraction of capital that should be risked for an optimal growth strategy.
+        capital_risked_pct = ((win_chance * win_amount) - ((1 - win_chance) * loss_amount)) / (win_amount * loss_amount)
+
+        # Normalize and cap the Kelly fraction. We don't want to risk more than 15% of capital.
+        capital_risked_pct = max(0, min(capital_risked_pct * self.kelly_norm_factor, 0.15))
+
+        # Determine how many spreads (no_trades) to buy based on the capital_risked_pct and the stop loss.
+        # We also cap at a maximum of 100 spreads for additional risk control.
+        no_trades = min(100, int((capital_risked_pct * self.Portfolio.TotalPortfolioValue) / position.stop_loss)) + 1
+
+        # If the calculated number of trades is zero or negative (e.g., due to unfavorable conditions), skip the trade.
         if no_trades <= 0:
             return
-        # self.Debug(f"Wing spread: ATM Strike: {atm_strike}, OTM Put: {position.K_P_OTM}, OTM Call: {position.K_C_OTM}, IV/HV Ratio: {iv_hv_ratio:.2f}")
-        # self.Debug(f"Max Loss reached at otm put and call: {position.expiry_payoff(position.K_P_OTM)}, {position.expiry_payoff(position.K_C_OTM)}")
-        # self.Debug(f"Stop Loss bounds are: {position.lower_bound}, {position.upper_bound}, with val: {position.expiry_payoff(position.upper_bound)}")
-        # self.Debug(f"Break-even bounds are: {position.lower_break_even}, {position.upper_break_even}, with val: {int(position.expiry_payoff(position.lower_break_even))}, win chance {win_chance}")
-        # self.Debug(f"Premium: {position.max_profit}, Stop Loss: {-position.stop_loss}")
-        # self.Debug(f"EV trade: {EV_of_expiry_profit}; Risking cpt_pct: {capital_risked_pct*100} %, at {no_trades} trades.")
-        
-        self.Debug(f"pct of winning {100*win_chance}%, EV is {EV_of_expiry_profit}, capital_risked_pct is {capital_risked_pct} with trades {no_trades}")
-        self.Debug(f"Trade placed at {self.time}")
+
+        self.Debug(f"Win probability: {100*win_chance:.2f}% | EV: {EV_of_expiry_profit:.2f} | "
+           f"Capital Risked: {capital_risked_pct*100:.2f}% | Trades: {no_trades}")
+        self.Debug(f"Trade placed at {self.Time}")
+
+        # Record the current capital for later PnL calculations
         self.capital_before_investment = self.Portfolio.TotalPortfolioValue
+
+        # Enter the trade by buying the calculated number of iron butterfly spreads
         self.Buy(position.iron_butterfly, no_trades)
+
+        # Mark that we are invested and store relevant details
         self.invested = True
         self.no_trades = no_trades
-        self.position = position  # Keep track of the active position
-
-    # def OnEndOfDay(self, symbol: Symbol) -> None:
-    #     self.invested = False
-        # if self.position is not None:
-        #     self.Debug(f"liquidate at end of day, position entered at {self.position.entry_time.hour}")
-        #     self.Liquidate()
-        #     self.position = None
-        #     pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
-        #     self.profit_from_expiry += pnl
-        #     self.Debug(f"return is {pnl}, net return from expiry is {self.profit_from_expiry}")
+        self.position = position
