@@ -7,7 +7,7 @@ from scipy.stats import t
 class ODTE_Options_Research(QCAlgorithm):
 
     def Initialize(self):
-        self.SetStartDate(2023, 5, 1)
+        self.SetStartDate(2023, 1, 1)
         self.SetCash(1000000)
 
         # Add SPY option data with hourly resolution
@@ -16,15 +16,15 @@ class ODTE_Options_Research(QCAlgorithm):
         option.SetFilter(self._filter)
 
         # Running window for price data
-        self.lookback_period = 65  # Lookback period for historical volatility
+        self.lookback_period = 10  # Lookback period for historical volatility
         self.price_window = deque(maxlen=self.lookback_period)
 
         # Running window for IV/HV ratios
-        self.window_len = 200
+        self.window_len = 30
         self.running_window = deque(maxlen=self.window_len)
 
         # Warm-up period for sufficient data collection
-        self.SetWarmUp(self.window_len, Resolution.Hour)
+        self.SetWarmUp(self.window_len, Resolution.DAILY)
 
         # Add SPY equity data
         self.spy = self.AddEquity("SPY", Resolution.Hour).Symbol
@@ -48,6 +48,12 @@ class ODTE_Options_Research(QCAlgorithm):
         self.profit_from_expiry = 0
         self.portfolio.set_margin_call_model(DefaultMarginCallModel(self.portfolio, self.default_order_properties))
         self.invested = False
+        self.small_EV = 0
+        self.negative_EV = 0
+        self.small_win_chance = 0
+        self.small_percentile = 0
+        self.negative_kelly = 0
+        self.zero_trades = 0
 
     def _filter(self, universe):
         """
@@ -283,6 +289,9 @@ class ODTE_Options_Research(QCAlgorithm):
 
     def create_t_distribution(self, atm):
         degrees_of_freedom, mean, scale = self.param_dict[self.Time.hour]
+        # #recalculate scale, which is stdv
+        # hourly_std = np.std(self.price_window)
+        # scale = hourly_std*np.sqrt(16-self.time.hour) 
         return degrees_of_freedom, atm*(1+mean), atm*scale
 
     def calculate_EV(self, new_degrees_of_freedom, new_mean, new_scale, payoff):
@@ -296,27 +305,40 @@ class ODTE_Options_Research(QCAlgorithm):
 
     def OnData(self, slice: Slice) -> None:
         spy_data = slice.Bars.get(self.spy)
-        if spy_data:
+        if spy_data and self.Time.hour == 16:
             self.update_price_window(spy_data.Close)
 
         historical_volatility = self.calculate_historical_volatility()
         chain = slice.OptionChains.get(self._symbol, None)
         if chain:
             atm_strike = sorted(chain, key=lambda x: abs(x.Strike - chain.Underlying.Price))[0].Strike
-            avg_iv = sum(x.ImpliedVolatility for x in chain) / len([i for i in chain])
+            avg_iv = None
+            for x in chain:
+                if x.Strike == atm_strike:
+                    avg_iv = x.ImpliedVolatility
+                    break
+            #self.Debug(f"iv is {avg_iv}, hv is {historical_volatility}")
             if historical_volatility and historical_volatility > 0:
                 iv_hv_ratio = avg_iv / historical_volatility
-                self.running_window.append(iv_hv_ratio)
+                if self.Time.hour == 16:
+                    self.running_window.append(iv_hv_ratio)
         else:
             return
 
-        if self.IsWarmingUp or self.Time.hour in [16]:
+        if self.IsWarmingUp:
             return
 
-        if self.Time.hour == 10:
-            self.Liquidate()
+        if self.Time.hour == 10 and self.position is not None:
+            self.Debug(f"Executing orders entered at {self.position.entry_time} because of expiry.")
+            #self.Liquidate()
             self.position = None
             self.invested = False
+            self.no_trades = None
+            pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
+            self.Debug(f"return is {pnl}") 
+        
+        if self.Time.hour in [0, 16]:
+            return
 
         if self.invested:
             if self.position is not None:
@@ -338,31 +360,43 @@ class ODTE_Options_Research(QCAlgorithm):
                 if iron_butterfly_prem_per_underlying_asset is None:
                     self.Debug("Error in calculating current payoff.")
                     return
-                
+
+                p_deg_freedom, p_mean, p_scale = self.create_t_distribution(chain.underlying.price)
+                EV_of_expiry_profit = self.calculate_EV(p_deg_freedom, p_mean, p_scale, self.position.expiry_payoff)
                 exit_profit = self.position.curr_payoff(iron_butterfly_prem_per_underlying_asset)
 
-                # Check if exit profit meets 25% profit target
-                if exit_profit >= 0.25 * self.position.max_profit:
-                    self.Debug(f"Closing position entered at {self.position.entry_time} to lock in a 25% profit target.")
+                # Check if we want to lock in: exit profit meets 25% profit target
+                if exit_profit > 0 or (EV_of_expiry_profit < exit_profit):
                     self.Liquidate()
+                    pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
+                    self.Debug(f"Closing position entered at {self.position.entry_time} to lock in a profit at {int(100*pnl/(self.no_trades*self.position.max_profit))}%.")
+                    self.Debug(f"return is {pnl}")
                     self.position = None
                     self.invested = False
                     self.no_trades = None
-                    pnl = self.Portfolio.TotalPortfolioValue - self.capital_before_investment
                     self.profit_from_exit += pnl
             return
 
         iv_hv_ratio = avg_iv / historical_volatility
-        iv_hv_lower_bound = 75
-        percentile = np.percentile(self.running_window, iv_hv_lower_bound)
-        if iv_hv_ratio < percentile:
+        iv_hv_lower_bound = 50
+        iv_hv_upper_bound = 100
+        lower_percentile = np.percentile(self.running_window, iv_hv_lower_bound)
+        upper_percentile = np.percentile(self.running_window, iv_hv_upper_bound)
+        if iv_hv_ratio < lower_percentile or iv_hv_ratio>upper_percentile:
+            self.small_percentile+=1
             return
 
         position, EV_of_expiry_profit = self.select_best_iron_butterfly(chain, atm_strike)
         if position is None:
+            self.negative_EV+=1
             return
         win_chance = self.probability_between_bounds(position.lower_break_even, position.upper_break_even, chain.underlying.price)
-        if win_chance < 0.5 or EV_of_expiry_profit < 10:
+        # if EV_of_expiry_profit < 5:
+        #     self.small_EV+=1
+        #     return
+        
+        if win_chance < 0.6:
+            self.small_win_chance+=1
             return
 
         # Calculate the adjusted maximum loss based on the position's stop loss
@@ -377,18 +411,19 @@ class ODTE_Options_Research(QCAlgorithm):
 
         # Calculate the Kelly fraction (capital_risked_pct) using a Kelly-like formula:
         # Kelly fraction ≈ ((p * win) - ((1 - p) * loss)) / (win * loss)
-        # This gives the fraction of capital that should be risked for an optimal growth strategy.
         capital_risked_pct = ((win_chance * win_amount) - ((1 - win_chance) * loss_amount)) / (win_amount * loss_amount)
-
+        if capital_risked_pct < 0:
+            self.negative_kelly +=1
+            return 
         # Normalize and cap the Kelly fraction. We don't want to risk more than 15% of capital.
         capital_risked_pct = max(0, min(capital_risked_pct * self.kelly_norm_factor, 0.15))
 
         # Determine how many spreads (no_trades) to buy based on the capital_risked_pct and the stop loss.
-        # We also cap at a maximum of 100 spreads for additional risk control.
         no_trades = min(100, int((capital_risked_pct * self.Portfolio.TotalPortfolioValue) / position.stop_loss)) + 1
 
         # If the calculated number of trades is zero or negative (e.g., due to unfavorable conditions), skip the trade.
         if no_trades <= 0:
+            self.zero_trades+=1
             return
 
         self.Debug(f"Win probability: {100*win_chance:.2f}% | EV: {EV_of_expiry_profit:.2f} | "
@@ -405,3 +440,13 @@ class ODTE_Options_Research(QCAlgorithm):
         self.invested = True
         self.no_trades = no_trades
         self.position = position
+
+    def OnEndOfAlgorithm(self):
+        # Print initialized values
+        self.Debug(f"small_EV: {self.small_EV}")
+        self.Debug(f"negative_EV: {self.negative_EV}")
+        self.Debug(f"small_win_chance: {self.small_win_chance}")
+        self.Debug(f"small_percentile: {self.small_percentile}")
+        self.Debug(f"negative_kelly: {self.negative_kelly}")
+        self.Debug(f"zero_trades: {self.zero_trades}")
+        self.Debug("Algorithm has completed!")
