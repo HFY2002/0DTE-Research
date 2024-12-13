@@ -16,11 +16,11 @@ class ODTE_Options_Research(QCAlgorithm):
         option.SetFilter(self._filter)
 
         # Running window for price data
-        self.lookback_period = 10  # Lookback period for historical volatility
+        self.lookback_period = 4  # Lookback period for historical volatility
         self.price_window = deque(maxlen=self.lookback_period)
 
         # Running window for IV/HV ratios
-        self.window_len = 30
+        self.window_len = 10
         self.running_window = deque(maxlen=self.window_len)
 
         # Warm-up period for sufficient data collection
@@ -82,10 +82,27 @@ class ODTE_Options_Research(QCAlgorithm):
         """
         if len(self.price_window) < self.lookback_period:
             return None
-        prices = np.array(list(self.price_window))
-        returns = np.diff(prices) / prices[:-1]
-        hv = np.std(returns) * (252 ** 0.5)  # Annualized volatility
+
+        prices = list(self.price_window)
+        # Calculate returns
+        returns = [(prices[i] - prices[i - 1]) / prices[i - 1] for i in range(1, len(prices))]
+        # Calculate mean of returns
+        mean_return = sum(returns) / len(returns)
+        # Calculate variance
+        variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+        # Calculate standard deviation and annualize
+        hv = (variance ** 0.5) * (252 ** 0.5)  # Annualized volatility
         return hv
+
+    def linspace(self, start, stop, num):
+        """
+        Mimics numpy.linspace without using numpy.
+        Generates `num` evenly spaced values between `start` and `stop`.
+        """
+        if num <= 1:
+            return [start]
+        step = (stop - start) / (num - 1)
+        return [start + i * step for i in range(num)]
 
     def select_best_iron_butterfly(self, chain, atm_strike):
         """
@@ -111,7 +128,7 @@ class ODTE_Options_Research(QCAlgorithm):
             return None, None
 
         # Evenly select wing spreads from the possible ones
-        indices = np.linspace(0, len(possible_wing_spreads) - 1, num_spreads).astype(int)
+        indices = [int(round(i)) for i in self.linspace(0, len(possible_wing_spreads) - 1, num_spreads)]
         wing_spreads = [possible_wing_spreads[i] for i in indices]
         best_ev = float('-inf')
         best_position = None
@@ -172,15 +189,18 @@ class ODTE_Options_Research(QCAlgorithm):
             # Original payoff calculation
             P_T = ((self.net_premium_received_per_underlying_asset - iron_butterfly_prem_per_underlying_asset) * self.m) - self.fee 
             # Adjust payoff for stop loss
-            P_T = np.maximum(P_T, -self.stop_loss) # Negative because loss is negative payoff
+            for x in P_T:
+                x = x
+            P_T = max(P_T, -self.stop_loss)  # Negative because loss is negative payoff
             return P_T
+
 
         def expiry_payoff(self, x):
             # Payoffs for the OTM and ATM options
-            C_T_OTM = np.maximum(x - self.K_C_OTM, 0)
-            C_T_ATM = np.maximum(x - self.K_C_ATM, 0)
-            P_T_OTM = np.maximum(self.K_P_OTM - x, 0)
-            P_T_ATM = np.maximum(self.K_P_ATM - x, 0)
+            C_T_OTM = max(x - self.K_C_OTM, 0)
+            C_T_ATM = max(x - self.K_C_ATM, 0)
+            P_T_OTM = max(self.K_P_OTM - x, 0)
+            P_T_ATM = max(self.K_P_ATM - x, 0)
             # Iron butterfly premium per underlying asset
             iron_butterfly_prem_per_underlying_asset = (C_T_ATM + P_T_ATM) - (C_T_OTM + P_T_OTM)
             return self.curr_payoff(iron_butterfly_prem_per_underlying_asset)
@@ -260,6 +280,7 @@ class ODTE_Options_Research(QCAlgorithm):
         net_premium_received_per_underlying_asset = self.iron_butterfly_prem_per_underlying_asset(iron_butterfly, chain, enter=True)
         if net_premium_received_per_underlying_asset is None:
             return None
+        self.Debug(f"K_C_ATM is {K_C_ATM}, type is {type(K_C_ATM)}")
 
         max_profit = net_premium_received_per_underlying_asset*m - fee
         wing_width = K_C_OTM - K_C_ATM
@@ -298,9 +319,12 @@ class ODTE_Options_Research(QCAlgorithm):
         distribution = t(df=new_degrees_of_freedom, loc=new_mean, scale=new_scale)
         lb = 0.001
         ub = 1 - lb
-        x = np.linspace(distribution.ppf(lb), distribution.ppf(ub), 1000)
+        x = self.linspace(distribution.ppf(lb), distribution.ppf(ub), 1000)
         pdf = distribution.pdf(x)
-        EV = np.sum(payoff(x) * pdf * (x[1] - x[0]))
+        # EV = np.sum(payoff(x) * pdf * (x[1] - x[0]))
+        # return EV
+        # Calculate expected value (EV)
+        EV = sum(payoff(xi) * pdfi * (x[1] - x[0]) for xi, pdfi in zip(x, pdf))
         return EV
 
     def OnData(self, slice: Slice) -> None:
@@ -378,7 +402,7 @@ class ODTE_Options_Research(QCAlgorithm):
             return
 
         iv_hv_ratio = avg_iv / historical_volatility
-        iv_hv_lower_bound = 50
+        iv_hv_lower_bound = 30
         iv_hv_upper_bound = 100
         lower_percentile = np.percentile(self.running_window, iv_hv_lower_bound)
         upper_percentile = np.percentile(self.running_window, iv_hv_upper_bound)
